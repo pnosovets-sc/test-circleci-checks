@@ -1,0 +1,239 @@
+defaults: &defaults
+  working_directory: ~/build
+  docker:
+    - image: opuscapita/pimline-ci:2.5.6-8u144-node8-mvn3-pl2
+      # To view image details - visit https://github.com/OpusCapita/pimline-circleci-images
+      auth:
+        username: ${DOCKER_USER}
+        password: ${DOCKER_PASS}
+
+
+version: 2
+jobs:
+  test_and_update_installation:
+    <<: *defaults
+    steps:
+      - run:
+          name: Environment inject
+          command: /bin/env_inject.sh
+
+      - checkout
+
+#### Test pimline-cli
+
+      - restore_cache:
+          keys:
+            - pimline-{{ .Branch }}-{{ checksum "package.json" }}
+            - pimline-{{ .Branch }}
+            - pimline
+
+      - run:
+          name: npm install
+          command: npm install
+
+      - run:
+          name: Run Tests
+          command: |
+            git config --global user.email "${GH_MAIL}"
+            git config --global user.name "${GH_NAME}"
+            npm test
+
+      - run:
+          name: npm build
+          command: npm build
+
+      - save_cache:
+          key: pimline-{{ .Branch }}-{{ checksum "package.json" }}
+          paths:
+            - ~/build/node_modules
+
+#### Update stage installation
+
+      - run:
+          name: Check settings.yml changes
+          command: ci-scripts/continuous-deployment/checkSettingsChanges.sh
+
+      - run:
+          name: Check builds concurrency
+          command: ci-scripts/continuous-deployment/checkBuildsConcurrency.sh
+
+      - run:
+          name: Azure login
+          command: az login -u ${AZURE_USER} -p ${AZURE_PASS}
+
+      - run:
+          name: Create stage VM
+          command: ./ci-scripts/continuous-deployment/azureVm.sh -i ${STAGE_ID} -l northeurope -s Standard_DS12_v2 -a create
+
+      - run:
+          name: Update Stage installation
+          command: |
+            scp -oStrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=300  ci-scripts/continuous-deployment/runInstallation.sh  ${INSTALLATION_USER}@${STAGE_INSTALLATION_ADDRESS}:/opt/runInstallation.sh
+            ssh -T -oStrictHostKeyChecking=no ${INSTALLATION_USER}@${STAGE_INSTALLATION_ADDRESS} << EOF
+              /opt/runInstallation.sh \
+                -r ${CIRCLE_SHA1} \
+                -d ${NPM_DEFAULT_REGISTRY} \
+                -a ${NPM_DEFAULT_REGISTRY_AUTH} \
+                -m ${NPM_DEFAULT_REGISTRY_MAIL} \
+                -u ${STAGE_INSTALLATION_ADDRESS} \
+            EOF
+
+      - run:
+          name: Wait data population
+          command: ci-scripts/continuous-deployment/waitDataPopulation.sh -u https://${STAGE_INSTALLATION_ADDRESS}/pim/login
+
+#### Run UI tests
+
+      - run:
+          name: Run pimline-tests
+          command: |
+            scp -oStrictHostKeyChecking=no ci-scripts/continuous-deployment/runAccepatanceTests.sh  ${INSTALLATION_USER}@${STAGE_INSTALLATION_ADDRESS}:/opt/runAccepatanceTests.sh
+            ssh -T -oStrictHostKeyChecking=no ${INSTALLATION_USER}@${STAGE_INSTALLATION_ADDRESS} << EOF
+              /opt/runAccepatanceTests.sh\
+                -a ${STAGE_INSTALLATION_ADDRESS} \
+                -r ${MAVEN_REPO} \
+                -u ${JFROG_USER} \
+                -p ${JFROG_PASSWD}
+            EOF
+
+      - run:
+          name: Copy test results
+          command: |
+            mkdir /serenity
+            cd /serenity && ssh ${INSTALLATION_USER}@${STAGE_INSTALLATION_ADDRESS} "cd /opt/pimline-tests/target/site/serenity && tar czfP - ./" | tar xzf -
+          when: always
+
+      - run:
+          name: Delete stage VM
+          command: ./ci-scripts/continuous-deployment/azureVm.sh -a stop -i ${STAGE_ID}
+          when: always
+
+      - store_test_results:
+          path: /serenity/
+
+      - store_artifacts:
+          path: /serenity/
+
+      - run:
+          name: Update commit status
+          command: |
+              export TARGET_URL=$(curl -s -u "${CIRCLE_CI_TOKEN}:" https://circleci.com/api/v1.1/project/github/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/${CIRCLE_BUILD_NUM}/artifacts | grep -o 'https://[^"]*serenity/index.html')
+              ci-scripts/continuous-deployment/updateGitCommitStatus.sh \
+              -u "${GH_NAME}:${GH_PASS}" \
+              -r ${CIRCLE_SHA1} \
+              -s success \
+              -t ${TARGET_URL} \
+              -c "Acceptance tests report"
+
+      - run:
+          name: Update commit status (in case of failure)
+          command: |
+              export TARGET_URL=$(curl -s -u "${CIRCLE_CI_TOKEN}:" https://circleci.com/api/v1.1/project/github/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/${CIRCLE_BUILD_NUM}/artifacts | grep -o 'https://[^"]*serenity/index.html')
+              ci-scripts/continuous-deployment/updateGitCommitStatus.sh \
+              -u "${GH_NAME}:${GH_PASS}" \
+              -r ${CIRCLE_SHA1} \
+              -s failure \
+              -t ${TARGET_URL} \
+              -c "Acceptance tests report"
+          when: on_fail
+
+
+#### Update prod installation
+
+      - run:
+          name: Update Prod installation
+          command: |
+            scp -oStrictHostKeyChecking=no ci-scripts/continuous-deployment/runInstallation.sh  ${INSTALLATION_USER}@${PROD_INSTALLATION_ADDRESS}:/opt/runInstallation.sh
+            ssh -T -oStrictHostKeyChecking=no ${INSTALLATION_USER}@${PROD_INSTALLATION_ADDRESS} << EOF
+              /opt/runInstallation.sh \
+                -r ${CIRCLE_SHA1} \
+                -d ${NPM_DEFAULT_REGISTRY} \
+                -a ${NPM_DEFAULT_REGISTRY_AUTH} \
+                -m ${NPM_DEFAULT_REGISTRY_MAIL} \
+                -u ${PROD_INSTALLATION_ADDRESS}
+            EOF
+
+      - run:
+          name: Slack notify
+          command: ci-scripts/continuous-deployment/slack_noitfy.sh  -u "${SLACK_RELEASE_WEBHOOK}" -i "https://${PROD_INSTALLATION_ADDRESS}/pim"
+
+      - run:
+          name: Echo
+          command: echo "Prod installation https://${PROD_INSTALLATION_ADDRESS}/pim was updated"
+
+
+  github_release:
+    <<: *defaults
+    steps:
+      - run:
+          name: Environment inject
+          command: /bin/env_inject.sh
+
+      - checkout
+
+      - run:
+          name: Create release
+          command: ./ci-scripts/continuous-deployment/createGitHubRelease.groovy -file ./settings.yml  -tag ${CIRCLE_TAG} -token ${GITHUB_TOKEN}
+
+      - run:
+          name: Update Pimline Wiki
+          command: ./ci-scripts/continuous-deployment/updateGitHubWiki.sh
+
+
+  update_aks_installation:
+    <<: *defaults
+    steps:
+      - run:
+          name: Environment inject
+          command: /bin/env_inject.sh
+
+      - checkout
+
+      - run:
+          name: Azure login
+          command: az login -u ${AZURE_USER} -p ${AZURE_PASS}
+
+      - run:
+          name: get AKS creds
+          command: az aks get-credentials -n pimline-aks -g pimline-aks-RG
+
+      - run: helm init --client-only
+
+      - run:
+          name: Update installation
+          command: ci-scripts/kubernetes/run-installation.sh -n ${CIRCLE_BRANCH} -s ./settings.yml
+
+      - run:
+          name: Slack notify
+          command: ci-scripts/continuous-deployment/slack_noitfy.sh  -u "${SLACK_RELEASE_WEBHOOK}" -i "https://aks.pim.dev.opuscapita.com/${CIRCLE_BRANCH}/pim" -m "AKS installation from \'${CIRCLE_BRANCH}\' branch was updated"
+
+      - run:
+          name: Echo
+          command: echo "AKS installation https://aks.pim.dev.opuscapita.com/${CIRCLE_BRANCH}/pim was updated"
+
+
+
+
+workflows:
+  version: 2
+  pimline_tests:
+    jobs:
+      - test_and_update_installation:
+          filters:
+            tags:
+              only: /.*/
+            branches:
+              only: master
+      - github_release:
+          requires:
+            - test_and_update_installation
+          filters:
+            tags:
+              only:
+                - /.*GA.*/
+            branches:
+              ignore: /.*/
+      - update_aks_installation:
+          filters:
+            branches:
+              only: master
