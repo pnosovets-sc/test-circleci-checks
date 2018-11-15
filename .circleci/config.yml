@@ -5,14 +5,14 @@ jobs:
     docker:
       - image: docker
     steps:
-      run: echo  "test job"
+      - run: echo  "test job"
 
   build:
     working_directory: ~/build
     docker:
       - image: docker
     steps:
-      run: echo  "build job"
+      - run: echo  "build job"
 
 
 workflows:
