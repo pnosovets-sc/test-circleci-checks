@@ -13,6 +13,7 @@ jobs:
       - image: docker
     steps:
       - run: echo  "build job"
+      - run : exit 1
 
 
 workflows:
